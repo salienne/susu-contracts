@@ -183,6 +183,74 @@ fn constructor_rejects_non_positive_contribution_amount() {
 
 #[test]
 #[should_panic]
+fn constructor_rejects_overflowing_pooled_contribution_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    env.register(
+        GroupContract,
+        (
+            Address::generate(&env),
+            Address::generate(&env),
+            token,
+            Address::generate(&env),
+            i128::MAX,
+            2u32,
+            ONE_WEEK,
+            MAX_FEE_BPS,
+        ),
+    );
+}
+
+#[test]
+#[should_panic]
+fn constructor_rejects_subtle_pooled_overflow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    env.register(
+        GroupContract,
+        (
+            Address::generate(&env),
+            Address::generate(&env),
+            token,
+            Address::generate(&env),
+            (i128::MAX / 3) + 1,
+            3u32,
+            ONE_WEEK,
+            MAX_FEE_BPS,
+        ),
+    );
+}
+
+#[test]
+fn constructor_accepts_max_safe_pooled_contribution_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    env.register(
+        GroupContract,
+        (
+            Address::generate(&env),
+            Address::generate(&env),
+            token,
+            Address::generate(&env),
+            i128::MAX / 3,
+            3u32,
+            ONE_WEEK,
+            MAX_FEE_BPS,
+        ),
+    );
+}
+
+#[test]
+#[should_panic]
 fn constructor_rejects_zero_member_capacity() {
     let env = Env::default();
     env.mock_all_auths();
@@ -246,6 +314,75 @@ fn constructor_rejects_capacity_above_the_maximum() {
             ONE_USDC,
             MAX_MEMBERS + 1,
             ONE_WEEK,
+            MAX_FEE_BPS,
+        ),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn constructor_rejects_zero_member_capacity_even_with_overflowing_contribution() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    env.register(
+        GroupContract,
+        (
+            Address::generate(&env),
+            Address::generate(&env),
+            token,
+            Address::generate(&env),
+            i128::MAX,
+            0u32,
+            ONE_WEEK,
+            MAX_FEE_BPS,
+        ),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn constructor_rejects_max_member_capacity_even_with_overflowing_contribution() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    env.register(
+        GroupContract,
+        (
+            Address::generate(&env),
+            Address::generate(&env),
+            token,
+            Address::generate(&env),
+            i128::MAX,
+            u32::MAX,
+            ONE_WEEK,
+            MAX_FEE_BPS,
+        ),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn constructor_rejects_zero_frequency_even_with_overflowing_contribution() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    env.register(
+        GroupContract,
+        (
+            Address::generate(&env),
+            Address::generate(&env),
+            token,
+            Address::generate(&env),
+            i128::MAX,
+            3u32,
+            0u64,
             MAX_FEE_BPS,
         ),
     );
@@ -971,5 +1108,51 @@ fn pool_balance_ignores_stray_transfers() {
         client.try_execute_payout(),
         Err(Ok(GroupError::ContributionsIncomplete)),
         "stray funds cannot trigger or inflate a payout"
+    );
+}
+
+#[test]
+#[should_panic]
+fn constructor_rejects_treasury_equal_to_group() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let group_id = Address::generate(&env);
+    let factory = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Registering with treasury = group_id should panic
+    env.register_at(
+        &group_id,
+        GroupContract,
+        (
+            factory,
+            creator,
+            token,
+            group_id.clone(),
+            10_000_000i128,
+            3u32,
+            604_800u64,
+            50u32,
+        ),
+    );
+}
+
+#[test]
+fn contribute_returns_arithmetic_overflow_when_contribution_count_overflows() {
+    let setup = setup_started(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+
+    setup.env.as_contract(&setup.group_id, || {
+        setup
+            .env
+            .storage()
+            .persistent()
+            .set(&DataKey::RoundContributionCount(1), &u32::MAX);
+    });
+
+    assert_eq!(
+        client.try_contribute(&setup.member(0), &setup.amount, &1u32),
+        Err(Ok(GroupError::ArithmeticOverflow))
     );
 }

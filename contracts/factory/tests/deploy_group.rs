@@ -17,7 +17,7 @@ use soroban_sdk::{
     testutils::{Address as _, Events as _},
     token, Address, Bytes, Env, Event as _,
 };
-use susu_factory::{FactoryContract, FactoryContractClient};
+use susu_factory::{FactoryContract, FactoryContractClient, FactoryError};
 use susu_group::{GroupContractClient, Status};
 
 /// The Group contract Wasm, built by `cargo build --target wasm32v1-none`.
@@ -124,6 +124,83 @@ fn create_group_assigns_distinct_addresses_and_monotonic_ids() {
 }
 
 #[test]
+fn group_created_carries_the_terms_frozen_at_creation_not_the_current_config() {
+    // The Factory's fee and treasury change later via `set_fee` / `set_treasury`, so
+    // the creation event is the only time-stamped record of what each group froze.
+    let harness = Harness::new();
+    let creator = Address::generate(&harness.env);
+
+    let first =
+        harness
+            .client
+            .create_group(&creator, &harness.token, &(10 * ONE_USDC), &3u32, &ONE_WEEK);
+    // `events().all()` only reflects the most recent invocation, so capture now.
+    let first_events = harness
+        .env
+        .events()
+        .all()
+        .filter_by_contract(&harness.factory_id);
+
+    let new_treasury = Address::generate(&harness.env);
+    harness.client.set_fee(&25u32);
+    harness.client.set_treasury(&new_treasury);
+
+    let second = harness.client.create_group(
+        &creator,
+        &harness.token,
+        &(20 * ONE_USDC),
+        &2u32,
+        &(2 * ONE_WEEK),
+    );
+    let second_events = harness
+        .env
+        .events()
+        .all()
+        .filter_by_contract(&harness.factory_id);
+
+    let first_expected = susu_factory::GroupCreated {
+        creator: creator.clone(),
+        group: first.clone(),
+        group_id: 1,
+        token: harness.token.clone(),
+        contribution_amount: 10 * ONE_USDC,
+        member_capacity: 3,
+        fee_bps: 50,
+        treasury: harness.treasury.clone(),
+        frequency_seconds: ONE_WEEK,
+    }
+    .to_xdr(&harness.env, &harness.factory_id);
+    let second_expected = susu_factory::GroupCreated {
+        creator,
+        group: second.clone(),
+        group_id: 2,
+        token: harness.token.clone(),
+        contribution_amount: 20 * ONE_USDC,
+        member_capacity: 2,
+        fee_bps: 25,
+        treasury: new_treasury.clone(),
+        frequency_seconds: 2 * ONE_WEEK,
+    }
+    .to_xdr(&harness.env, &harness.factory_id);
+    assert!(first_events.events().contains(&first_expected));
+    assert!(second_events.events().contains(&second_expected));
+
+    // Each event agrees with what the group itself froze at construction.
+    let first_config = GroupContractClient::new(&harness.env, &first)
+        .get_group()
+        .config;
+    assert_eq!(first_config.fee_bps, 50);
+    assert_eq!(first_config.treasury, harness.treasury);
+    assert_eq!(first_config.frequency_seconds, ONE_WEEK);
+    let second_config = GroupContractClient::new(&harness.env, &second)
+        .get_group()
+        .config;
+    assert_eq!(second_config.fee_bps, 25);
+    assert_eq!(second_config.treasury, new_treasury);
+    assert_eq!(second_config.frequency_seconds, 2 * ONE_WEEK);
+}
+
+#[test]
 fn a_deployed_group_runs_a_full_cycle() {
     // The Factory's job is to produce a group that is correct; verify one end to end.
     let harness = Harness::new();
@@ -180,7 +257,130 @@ fn a_deployed_group_runs_a_full_cycle() {
         token: harness.token.clone(),
         contribution_amount: 10 * ONE_USDC,
         member_capacity: 3,
+        fee_bps: 50,
+        treasury: harness.treasury.clone(),
+        frequency_seconds: ONE_WEEK,
     }
     .to_xdr(&harness.env, &harness.factory_id);
     assert!(created_events.events().contains(&expected));
+}
+
+#[test]
+fn factory_config_changes_only_affect_future_groups() {
+    let harness = Harness::new();
+    let creator = Address::generate(&harness.env);
+
+    // 1. Create Group A with the factory's initial fee (50 bps) and initial treasury.
+    let group_a_address =
+        harness
+            .client
+            .create_group(&creator, &harness.token, &(10 * ONE_USDC), &3u32, &ONE_WEEK);
+    let group_a = GroupContractClient::new(&harness.env, &group_a_address);
+    assert_eq!(group_a.get_group().config.fee_bps, 50);
+    assert_eq!(group_a.get_group().config.treasury, harness.treasury);
+
+    // 2. Admin updates fee to 10 bps and updates the treasury address.
+    let new_treasury = Address::generate(&harness.env);
+    harness.client.set_fee(&10u32);
+    harness.client.set_treasury(&new_treasury);
+
+    // 3. Create Group B after configuration changes.
+    let group_b_address =
+        harness
+            .client
+            .create_group(&creator, &harness.token, &(10 * ONE_USDC), &2u32, &ONE_WEEK);
+    let group_b = GroupContractClient::new(&harness.env, &group_b_address);
+
+    // 4. Assert Group A's frozen terms are preserved and Group B received the new terms.
+    let state_a = group_a.get_group();
+    assert_eq!(state_a.config.fee_bps, 50);
+    assert_eq!(state_a.config.treasury, harness.treasury);
+
+    let state_b = group_b.get_group();
+    assert_eq!(state_b.config.fee_bps, 10);
+    assert_eq!(state_b.config.treasury, new_treasury);
+
+    // 5. Verify financial execution honors the frozen terms independently.
+    let asset_client = token::StellarAssetClient::new(&harness.env, &harness.token);
+    let token_client = token::Client::new(&harness.env, &harness.token);
+
+    // Join and run round 1 of Group A (3 members x 10 USDC = 30 USDC, 50 bps fee = 0.15 USDC)
+    let a_m0 = Address::generate(&harness.env);
+    let a_m1 = Address::generate(&harness.env);
+    let a_m2 = Address::generate(&harness.env);
+    for m in [&a_m0, &a_m1, &a_m2] {
+        asset_client.mint(m, &(100 * ONE_USDC));
+        group_a.join(m);
+    }
+    group_a.start();
+    for m in [&a_m0, &a_m1, &a_m2] {
+        group_a.contribute(m, &(10 * ONE_USDC), &1u32);
+    }
+    group_a.execute_payout();
+    assert_eq!(token_client.balance(&harness.treasury), 1_500_000);
+
+    // Join and run round 1 of Group B (2 members x 10 USDC = 20 USDC, 10 bps fee = 0.02 USDC)
+    let b_m0 = Address::generate(&harness.env);
+    let b_m1 = Address::generate(&harness.env);
+    for m in [&b_m0, &b_m1] {
+        asset_client.mint(m, &(100 * ONE_USDC));
+        group_b.join(m);
+    }
+    group_b.start();
+    for m in [&b_m0, &b_m1] {
+        group_b.contribute(m, &(10 * ONE_USDC), &1u32);
+    }
+    group_b.execute_payout();
+    assert_eq!(token_client.balance(&new_treasury), 200_000);
+}
+
+#[test]
+fn factory_pause_does_not_affect_existing_groups() {
+    let harness = Harness::new();
+    let creator = Address::generate(&harness.env);
+
+    // 1. Deploy and initialize group while factory is running normally.
+    let group_address =
+        harness
+            .client
+            .create_group(&creator, &harness.token, &(10 * ONE_USDC), &2u32, &ONE_WEEK);
+    let group = GroupContractClient::new(&harness.env, &group_address);
+
+    let m1 = Address::generate(&harness.env);
+    let m2 = Address::generate(&harness.env);
+    let asset_client = token::StellarAssetClient::new(&harness.env, &harness.token);
+    asset_client.mint(&m1, &(50 * ONE_USDC));
+    asset_client.mint(&m2, &(50 * ONE_USDC));
+
+    group.join(&m1);
+    group.join(&m2);
+    group.start();
+
+    // 2. Factory is paused by admin.
+    harness.client.pause();
+    assert!(harness.client.get_config().paused);
+
+    // 3. New group creation is refused.
+    assert_eq!(
+        harness.client.try_create_group(
+            &creator,
+            &harness.token,
+            &(10 * ONE_USDC),
+            &2u32,
+            &ONE_WEEK,
+        ),
+        Err(Ok(FactoryError::Paused))
+    );
+
+    // 4. Existing group continues its lifecycle uninterrupted: contribute and payout.
+    group.contribute(&m1, &(10 * ONE_USDC), &1u32);
+    group.contribute(&m2, &(10 * ONE_USDC), &1u32);
+    group.execute_payout();
+
+    // Round 2
+    group.contribute(&m1, &(10 * ONE_USDC), &2u32);
+    group.contribute(&m2, &(10 * ONE_USDC), &2u32);
+    group.execute_payout();
+
+    assert_eq!(group.get_status(), Status::Completed);
 }

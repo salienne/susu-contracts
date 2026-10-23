@@ -33,7 +33,7 @@ use soroban_sdk::{
 };
 
 /// Contract version reported by `version()`. Bumped with each released interface.
-const CONTRACT_VERSION: u32 = 2;
+const CONTRACT_VERSION: u32 = 3;
 
 /// Protocol maximum fee, in basis points. The MVP protocol fee is 0.50%.
 ///
@@ -94,6 +94,12 @@ pub enum FactoryError {
     GroupNotFound = 6,
     /// Integer arithmetic overflowed. Never expected for valid inputs.
     ArithmeticOverflow = 7,
+    /// Treasury address cannot be the admin or the factory itself.
+    InvalidTreasury = 8,
+    /// The Factory has no configuration entry. Reported instead of panicking so
+    /// the admin can still reach `pause` and recover a contract whose instance
+    /// entry has archived.
+    NotInitialized = 9,
 }
 
 /// A new group contract was deployed and registered.
@@ -108,6 +114,9 @@ pub struct GroupCreated {
     pub token: Address,
     pub contribution_amount: i128,
     pub member_capacity: u32,
+    pub fee_bps: u32,
+    pub treasury: Address,
+    pub frequency_seconds: u64,
 }
 
 /// The protocol fee applied to newly created groups changed.
@@ -155,6 +164,9 @@ impl FactoryContract {
         if fee_bps == 0 || fee_bps > MAX_FEE_BPS {
             soroban_sdk::panic_with_error!(&env, FactoryError::InvalidFeeBps);
         }
+        if treasury == admin || treasury == env.current_contract_address() {
+            soroban_sdk::panic_with_error!(&env, FactoryError::InvalidTreasury);
+        }
         let config = FactoryConfig {
             admin,
             treasury,
@@ -188,12 +200,16 @@ impl FactoryContract {
         extend_instance_ttl(&env);
 
         let storage = env.storage().instance();
-        let config: FactoryConfig = storage.get(&DataKey::Config).unwrap();
+        let config = load_config(&env)?;
 
         if config.paused {
             return Err(FactoryError::Paused);
         }
-        if contribution_amount <= 0 {
+        if contribution_amount <= 0
+            || contribution_amount
+                .checked_mul(member_capacity as i128)
+                .is_none()
+        {
             return Err(FactoryError::InvalidContributionAmount);
         }
         if !(MIN_MEMBERS..=MAX_MEMBERS).contains(&member_capacity) {
@@ -243,6 +259,9 @@ impl FactoryContract {
             token,
             contribution_amount,
             member_capacity,
+            fee_bps: config.fee_bps,
+            treasury: config.treasury,
+            frequency_seconds,
         }
         .publish(&env);
 
@@ -259,7 +278,7 @@ impl FactoryContract {
     /// Capped at `MAX_FEE_BPS`, so the protocol can never charge more than 0.50%.
     /// Existing groups are unaffected: they froze their fee at construction.
     pub fn set_fee(env: Env, fee_bps: u32) -> Result<(), FactoryError> {
-        require_admin(&env);
+        require_admin(&env)?;
         extend_instance_ttl(&env);
 
         if fee_bps == 0 || fee_bps > MAX_FEE_BPS {
@@ -267,7 +286,7 @@ impl FactoryContract {
         }
 
         let storage = env.storage().instance();
-        let mut config: FactoryConfig = storage.get(&DataKey::Config).unwrap();
+        let mut config = load_config(&env)?;
         config.fee_bps = fee_bps;
         storage.set(&DataKey::Config, &config);
 
@@ -280,11 +299,14 @@ impl FactoryContract {
     /// Existing groups are unaffected: they froze their treasury at construction, so
     /// a treasury change can never redirect fees already owed to a group.
     pub fn set_treasury(env: Env, treasury: Address) -> Result<(), FactoryError> {
-        require_admin(&env);
+        require_admin(&env)?;
         extend_instance_ttl(&env);
 
         let storage = env.storage().instance();
-        let mut config: FactoryConfig = storage.get(&DataKey::Config).unwrap();
+        let mut config = load_config(&env)?;
+        if treasury == config.admin || treasury == env.current_contract_address() {
+            return Err(FactoryError::InvalidTreasury);
+        }
         config.treasury = treasury.clone();
         storage.set(&DataKey::Config, &config);
 
@@ -298,11 +320,11 @@ impl FactoryContract {
     /// rounds, payouts and funds are entirely outside the Factory's reach. It cannot
     /// block a contribution or a payout either.
     pub fn pause(env: Env) -> Result<(), FactoryError> {
-        require_admin(&env);
+        require_admin(&env)?;
         extend_instance_ttl(&env);
 
         let storage = env.storage().instance();
-        let mut config: FactoryConfig = storage.get(&DataKey::Config).unwrap();
+        let mut config = load_config(&env)?;
         config.paused = true;
         storage.set(&DataKey::Config, &config);
 
@@ -312,11 +334,11 @@ impl FactoryContract {
 
     /// Re-enable creation of new groups.
     pub fn unpause(env: Env) -> Result<(), FactoryError> {
-        require_admin(&env);
+        require_admin(&env)?;
         extend_instance_ttl(&env);
 
         let storage = env.storage().instance();
-        let mut config: FactoryConfig = storage.get(&DataKey::Config).unwrap();
+        let mut config = load_config(&env)?;
         config.paused = false;
         storage.set(&DataKey::Config, &config);
 
@@ -329,20 +351,33 @@ impl FactoryContract {
     // -----------------------------------------------------------------------
 
     /// The Factory's current configuration.
-    pub fn get_config(env: Env) -> FactoryConfig {
-        env.storage().instance().get(&DataKey::Config).unwrap()
+    ///
+    /// Extends the instance TTL like the mutating paths do, so a Factory that is
+    /// only ever read keeps its configuration. Returns `NotInitialized` rather
+    /// than unwrapping, so a missing entry is a typed error and not a panic that
+    /// would take the whole contract's interface down with it.
+    pub fn get_config(env: Env) -> Result<FactoryConfig, FactoryError> {
+        extend_instance_ttl(&env);
+        load_config(&env)
     }
 
     /// The address of a group by id.
     pub fn get_group(env: Env, group_id: u32) -> Result<Address, FactoryError> {
-        match env.storage().persistent().get(&DataKey::Group(group_id)) {
-            Some(address) => Ok(address),
+        let key = DataKey::Group(group_id);
+        match env.storage().persistent().get(&key) {
+            Some(address) => {
+                // Reading a group keeps it alive as well; otherwise a group that
+                // is looked up but not otherwise touched could still archive.
+                extend_persistent_ttl(&env, &key);
+                Ok(address)
+            }
             None => Err(FactoryError::GroupNotFound),
         }
     }
 
     /// The number of groups created so far.
     pub fn get_group_count(env: Env) -> u32 {
+        extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::GroupCount)
@@ -369,9 +404,23 @@ pub fn group_salt(env: &Env, group_id: u32) -> BytesN<32> {
 }
 
 /// Requires the protocol admin's authorization.
-fn require_admin(env: &Env) {
-    let config: FactoryConfig = env.storage().instance().get(&DataKey::Config).unwrap();
+fn require_admin(env: &Env) -> Result<(), FactoryError> {
+    let config = load_config(env)?;
     config.admin.require_auth();
+    Ok(())
+}
+
+/// Reads the Factory configuration, or reports `NotInitialized`.
+///
+/// The constructor always writes `Config`, so an absent entry means the instance
+/// has been archived. Returning a typed error instead of panicking is what lets
+/// `pause` still be reached: a panic here would leave the admin unable to restore
+/// the contract through its own interface.
+fn load_config(env: &Env) -> Result<FactoryConfig, FactoryError> {
+    env.storage()
+        .instance()
+        .get(&DataKey::Config)
+        .ok_or(FactoryError::NotInitialized)
 }
 
 /// Extends the instance entry's TTL so the Factory never archives.

@@ -9,7 +9,7 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events as _},
+    testutils::{Address as _, Events as _, Ledger as _},
     Event,
 };
 
@@ -45,7 +45,7 @@ fn constructor_stores_configuration() {
     assert_eq!(config.fee_bps, MAX_FEE_BPS);
     assert!(!config.paused, "a new Factory is not paused");
     assert_eq!(client.get_group_count(), 0);
-    assert_eq!(client.version(), 2);
+    assert_eq!(client.version(), 3);
 }
 
 #[test]
@@ -196,6 +196,69 @@ fn get_group_fails_for_an_unknown_id() {
 }
 
 // ---------------------------------------------------------------------------
+// Storage, TTL and initialization
+// ---------------------------------------------------------------------------
+
+#[test]
+fn read_paths_extend_the_instance_ttl() {
+    use soroban_sdk::testutils::Deployer as _;
+    let (env, _, _, client) = setup(MAX_FEE_BPS);
+
+    // No write has run since construction, so only the read path can be what
+    // restores the TTL headroom.
+    let config = client.get_config();
+    assert_eq!(config.fee_bps, MAX_FEE_BPS);
+
+    let ttl = env.deployer().get_contract_instance_ttl(&client.address);
+    assert!(
+        ttl > INSTANCE_TTL_THRESHOLD,
+        "a read must extend the instance TTL so the Factory never archives (ttl={ttl})"
+    );
+}
+
+#[test]
+fn reads_still_answer_after_the_threshold_has_passed() {
+    let (env, admin, treasury, client) = setup(MAX_FEE_BPS);
+
+    // Well past the point where an unextended instance entry would be a problem.
+    env.ledger()
+        .set_sequence_number(INSTANCE_TTL_THRESHOLD + 10);
+
+    let config = client.get_config();
+    assert_eq!(config.admin, admin);
+    assert_eq!(config.treasury, treasury);
+    assert_eq!(config.fee_bps, MAX_FEE_BPS);
+    assert_eq!(client.get_group_count(), 0);
+}
+
+#[test]
+fn missing_configuration_is_a_typed_error_not_a_panic() {
+    let (env, _, _, client) = setup(MAX_FEE_BPS);
+
+    // Simulate the instance entry having been archived: every entry point must
+    // report `NotInitialized` rather than dereferencing a missing value.
+    env.as_contract(&client.address, || {
+        env.storage().instance().remove(&DataKey::Config);
+    });
+
+    assert_eq!(
+        client.try_get_config(),
+        Err(Ok(FactoryError::NotInitialized))
+    );
+    assert_eq!(
+        client.try_set_fee(&10u32),
+        Err(Ok(FactoryError::NotInitialized)),
+        "an admin call must report NotInitialized rather than panicking"
+    );
+    assert_eq!(
+        client.try_set_treasury(&Address::generate(&env)),
+        Err(Ok(FactoryError::NotInitialized))
+    );
+    assert_eq!(client.try_pause(), Err(Ok(FactoryError::NotInitialized)));
+    assert_eq!(client.try_unpause(), Err(Ok(FactoryError::NotInitialized)));
+}
+
+// ---------------------------------------------------------------------------
 // create_group validation
 //
 // These run before any deployment, so they need no Group Wasm. A placeholder hash
@@ -226,6 +289,14 @@ fn create_group_rejects_invalid_parameters() {
     );
     assert_eq!(
         client.try_create_group(&creator, &token, &(-1i128), &3u32, &604_800u64),
+        Err(Ok(FactoryError::InvalidContributionAmount))
+    );
+    assert_eq!(
+        client.try_create_group(&creator, &token, &i128::MAX, &2u32, &604_800u64),
+        Err(Ok(FactoryError::InvalidContributionAmount))
+    );
+    assert_eq!(
+        client.try_create_group(&creator, &token, &(i128::MAX / 3 + 1), &3u32, &604_800u64),
         Err(Ok(FactoryError::InvalidContributionAmount))
     );
     assert_eq!(
@@ -264,4 +335,29 @@ fn create_group_is_refused_while_paused() {
         Err(Ok(FactoryError::Paused)),
         "pausing must block new groups"
     );
+}
+
+#[test]
+#[should_panic]
+fn constructor_rejects_treasury_equal_to_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+    env.register(
+        FactoryContract,
+        (admin.clone(), wasm_hash, admin.clone(), MAX_FEE_BPS),
+    );
+}
+
+#[test]
+fn set_treasury_rejects_admin_or_factory_address() {
+    let (_env, admin, _, client) = setup(MAX_FEE_BPS);
+    let factory_addr = client.address.clone();
+
+    let res_admin = client.try_set_treasury(&admin);
+    assert_eq!(res_admin, Err(Ok(FactoryError::InvalidTreasury)));
+
+    let res_factory = client.try_set_treasury(&factory_addr);
+    assert_eq!(res_factory, Err(Ok(FactoryError::InvalidTreasury)));
 }

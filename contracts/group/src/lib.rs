@@ -252,6 +252,8 @@ pub enum GroupError {
     /// Defensive: unreachable by construction, asserted so any future change to
     /// the money math fails loudly instead of silently mis-splitting funds.
     SplitInvariantViolated = 19,
+    /// Treasury address cannot be the group contract address.
+    InvalidTreasury = 20,
 }
 
 // ---------------------------------------------------------------------------
@@ -343,14 +345,21 @@ impl GroupContract {
         frequency_seconds: u64,
         fee_bps: u32,
     ) {
-        if contribution_amount <= 0 {
-            soroban_sdk::panic_with_error!(&env, GroupError::InvalidContributionAmount);
-        }
         if !(MIN_MEMBERS..=MAX_MEMBERS).contains(&member_capacity) {
             soroban_sdk::panic_with_error!(&env, GroupError::InvalidMemberCapacity);
         }
         if frequency_seconds == 0 {
             soroban_sdk::panic_with_error!(&env, GroupError::InvalidFrequency);
+        }
+        if contribution_amount <= 0
+            || contribution_amount
+                .checked_mul(member_capacity as i128)
+                .is_none()
+        {
+            soroban_sdk::panic_with_error!(&env, GroupError::InvalidContributionAmount);
+        }
+        if treasury == env.current_contract_address() {
+            soroban_sdk::panic_with_error!(&env, GroupError::InvalidTreasury);
         }
         // The fee ceiling is enforced here *and* in the Factory, so a group can
         // never charge more than the protocol maximum even if it were deployed
@@ -519,7 +528,10 @@ impl GroupContract {
         };
         let count_key = DataKey::RoundContributionCount(round);
         let contribution_count: u32 = persistent.get(&count_key).unwrap_or(0);
-        let new_count = contribution_count + 1;
+        let new_count = match contribution_count.checked_add(1) {
+            Some(value) => value,
+            None => return Err(GroupError::ArithmeticOverflow),
+        };
 
         persistent.set(&DataKey::RoundPool(round), &new_pool);
         persistent.set(&count_key, &new_count);
